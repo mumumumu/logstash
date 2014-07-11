@@ -2,6 +2,35 @@
 require "logstash/inputs/base"
 require "logstash/namespace"
 
+# Monkey patch to fix the REXML's failure of parsing XML that xmpp servers send.
+# See https://github.com/lnussbaum/xmpp4r/issues/3
+require 'socket'
+class TCPSocket
+  def external_encoding
+    Encoding::BINARY
+  end
+end
+
+require 'rexml/source'
+class REXML::IOSource
+  alias_method :encoding_assign, :encoding=
+  def encoding=(value)
+    encoding_assign(value) if value
+  end
+end
+
+begin
+  # OpenSSL is optional and can be missing
+  require 'openssl'
+  class OpenSSL::SSL::SSLSocket
+    def external_encoding
+      Encoding::BINARY
+    end
+  end
+rescue
+end
+# End monkey patch
+
 # This input allows you to receive events over XMPP/Jabber.
 #
 # This plugin can be used for accepting events from humans or applications
@@ -27,10 +56,13 @@ class LogStash::Inputs::Xmpp < LogStash::Inputs::Base
   # The xmpp server to connect to. This is optional. If you omit this setting,
   # the host on the user/identity is used. (foo.com for user@foo.com)
   config :host, :validate => :string
+  config :port, :validate => :number, :default => 5222
+  config :use_ssl, :validate => :boolean, :default => false
 
   # Set to true to enable greater debugging in XMPP. Useful for debugging
   # network/authentication erros.
   config :debug, :validate => :boolean, :default => false, :deprecated => "Use the logstash --debug flag for this instead."
+
 
   public
   def register
@@ -38,7 +70,8 @@ class LogStash::Inputs::Xmpp < LogStash::Inputs::Base
     Jabber::debug = true if @debug || @logger.debug?
 
     @client = Jabber::Client.new(Jabber::JID.new(@user))
-    @client.connect(@host) # it is ok if host is nil
+    @client.use_ssl = @use_ssl
+    @client.connect(@host, @port) # it is ok if host is nil
     @client.auth(@password.value)
     @client.send(Jabber::Presence.new.set_type(:available))
 
@@ -51,7 +84,6 @@ class LogStash::Inputs::Xmpp < LogStash::Inputs::Base
     if @rooms
       @rooms.each do |room| # handle muc messages in different rooms
         @muc = Jabber::MUC::SimpleMUCClient.new(@client)
-        @muc.join(room)
         @muc.on_message do |time,from,body|
           @codec.decode(body) do |event|
             decorate(event)
@@ -60,6 +92,7 @@ class LogStash::Inputs::Xmpp < LogStash::Inputs::Base
             queue << event
           end
         end # @muc.on_message
+        @muc.join(room)
       end # @rooms.each
     end # if @rooms
 
